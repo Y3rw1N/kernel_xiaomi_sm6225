@@ -4,31 +4,36 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 cd "$ROOT"
 
-KSU_DEV=e5f5ec998de88b9fc43c62cff8f7ae12d3f4800a
-KSU_STABLE=v3.4.0-legacy
-DEFCONFIG=vendor/spes-perf_defconfig
-AK3_REPO=https://github.com/osm0sis/AnyKernel3.git
-AK3_REF=41f04bdb4ee30a44e429c2c1131d5e8bb32b15f1
+DEFCONFIG=${DEFCONFIG:-vendor/spes-perf_defconfig}
+AK3_REPO=${AK3_REPO:-https://github.com/osm0sis/AnyKernel3.git}
+AK3_REF=${AK3_REF:-41f04bdb4ee30a44e429c2c1131d5e8bb32b15f1}
 
 JOBS=$(nproc)
 BOOT_IMG=""
 OTA_ZIP=""
 MAKE_ZIP=0
 CLEAN=0
+UPDATE=0
 VARIANTS=()
 
 usage() {
     cat <<EOF
-Uso: ./build.sh [dev|stable|all] [opciones]
+Usage: ./build.sh [dev|stable|all] [options]
 
-  -b, --boot IMG   boot.img base de la ROM para generar boot-<versión>.img
-  -o, --ota ZIP    sacar el boot.img base de una OTA (payload.bin)
-  -z, --zip        generar zip AnyKernel3
-  -j, --jobs N     trabajos de make (por defecto: $JOBS)
-  -c, --clean      compilar desde cero
-  -h, --help       esta ayuda
+  -b, --boot IMG   stock boot.img to repack as boot-<release>.img
+  -o, --ota ZIP    take the stock boot.img from an OTA zip (payload.bin)
+  -z, --zip        build an AnyKernel3 zip
+  -u, --update     fetch new KernelSU-Next legacy commits and tags first
+  -j, --jobs N     make jobs (default: $JOBS)
+  -c, --clean      build from scratch
+  -h, --help       show this help
 
-Variante por defecto: dev. Salida en out/release/<variante>/
+Variants (default: dev):
+  dev      KernelSU-Next commit recorded in this repo (or \$KSU_DEV)
+  stable   newest v*-legacy tag (or \$KSU_STABLE)
+
+Output: out/release/<variant>/
+Overrides: KSU_DEV, KSU_STABLE, DEFCONFIG, AK3_REPO, AK3_REF
 EOF
 }
 
@@ -39,38 +44,50 @@ while [ $# -gt 0 ]; do
     case $1 in
         dev|stable) VARIANTS+=("$1") ;;
         all) VARIANTS+=(dev stable) ;;
-        -b|--boot) BOOT_IMG=$(realpath "${2:?falta el archivo}"); shift ;;
-        -o|--ota) OTA_ZIP=$(realpath "${2:?falta el archivo}"); shift ;;
+        -b|--boot) BOOT_IMG=$(realpath "${2:?missing file}"); shift ;;
+        -o|--ota) OTA_ZIP=$(realpath "${2:?missing file}"); shift ;;
         -z|--zip) MAKE_ZIP=1 ;;
-        -j|--jobs) JOBS=${2:?falta el número}; shift ;;
+        -u|--update) UPDATE=1 ;;
+        -j|--jobs) JOBS=${2:?missing number}; shift ;;
         -c|--clean) CLEAN=1 ;;
         -h|--help) usage; exit 0 ;;
-        *) usage >&2; die "opción desconocida: $1" ;;
+        *) usage >&2; die "unknown option: $1" ;;
     esac
     shift
 done
 [ ${#VARIANTS[@]} -gt 0 ] || VARIANTS=(dev)
 
 for tool in clang ld.lld llvm-ar bc git python3; do
-    command -v "$tool" >/dev/null || die "falta $tool"
+    command -v "$tool" >/dev/null || die "$tool not found"
 done
-[ $MAKE_ZIP = 0 ] || command -v zip >/dev/null || die "falta zip"
-[ -e KernelSU-Next/kernel/Kconfig ] || die "submódulo KernelSU-Next vacío: git submodule update --init"
+[ $MAKE_ZIP = 0 ] || command -v zip >/dev/null || die "zip not found"
+[ -e KernelSU-Next/kernel/Kconfig ] || die "KernelSU-Next submodule is empty: git submodule update --init"
 
 MAKE_ARGS=(ARCH=arm64 LLVM=1)
 ssl_major=$(pkg-config --modversion libcrypto 2>/dev/null | cut -d. -f1 || true)
 if [ "${ssl_major:-0}" -ge 4 ]; then
-    [ -d /usr/lib/openssl-3 ] || die "OpenSSL $ssl_major no tiene ENGINE (scripts/extract-cert): instala openssl-3"
+    [ -d /usr/lib/openssl-3 ] || die "OpenSSL $ssl_major dropped ENGINE (scripts/extract-cert): install openssl-3"
     export PKG_CONFIG_PATH=/usr/lib/openssl-3/pkgconfig
     MAKE_ARGS+=(HOSTLDFLAGS=-Wl,-rpath,/usr/lib/openssl-3)
 fi
 
+if [ $UPDATE = 1 ]; then
+    msg "fetching KernelSU-Next legacy"
+    git -C KernelSU-Next fetch -q origin legacy --tags
+    echo "    legacy HEAD: $(git -C KernelSU-Next rev-parse --short FETCH_HEAD)"
+fi
+
+KSU_DEV=${KSU_DEV:-$(git ls-tree HEAD KernelSU-Next | awk '{print $3}')}
+KSU_STABLE=${KSU_STABLE:-$(git -C KernelSU-Next tag -l 'v*-legacy' --sort=-v:refname | head -1)}
+[ -n "$KSU_DEV" ] || die "no KernelSU-Next commit recorded in HEAD"
+[ -n "$KSU_STABLE" ] || die "no v*-legacy tag found (try --update)"
+
 if [ -n "$OTA_ZIP" ]; then
-    msg "boot.img base desde $(basename "$OTA_ZIP")"
+    msg "stock boot.img from $(basename "$OTA_ZIP")"
     python3 -I build/payload_extract.py "$OTA_ZIP" out/base boot
     BOOT_IMG=$ROOT/out/base/boot.img
 fi
-[ -z "$BOOT_IMG" ] || [ -f "$BOOT_IMG" ] || die "no existe $BOOT_IMG"
+[ -z "$BOOT_IMG" ] || [ -f "$BOOT_IMG" ] || die "$BOOT_IMG does not exist"
 
 ksu_orig=$(git -C KernelSU-Next rev-parse HEAD)
 trap 'git -C "$ROOT/KernelSU-Next" checkout -q "$ksu_orig"' EXIT
@@ -84,16 +101,14 @@ ksu_checkout() {
 }
 
 ak3_zip() {
-    local name=$1 dest=$2 ak=$ROOT/out/AnyKernel3 stage
-    if [ ! -d "$ak/.git" ]; then
-        git clone -q "$AK3_REPO" "$ak"
-    fi
+    local name=$1 dest=$2 ak=$ROOT/out/AnyKernel3 stage zipname
+    [ -d "$ak/.git" ] || git clone -q "$AK3_REPO" "$ak"
     git -C "$ak" cat-file -e "$AK3_REF^{commit}" 2>/dev/null || git -C "$ak" fetch -q origin
     git -C "$ak" checkout -q "$AK3_REF"
     stage=$(mktemp -d)
     cp -r "$ak"/{META-INF,tools,modules,patch,ramdisk,LICENSE} "$stage"/
     cp build/anykernel.sh "$dest/Image.gz" "$stage"/
-    local zipname="${localversion#-}-$name-spes-$(date +%Y%m%d).zip"
+    zipname="${localversion#-}-$name-spes-$(date +%Y%m%d).zip"
     rm -f "$dest/$zipname"
     (cd "$stage" && zip -qr9 "$dest/$zipname" . -x '.git*' 'README.md')
     rm -rf "$stage"
@@ -102,19 +117,20 @@ ak3_zip() {
 
 build_variant() {
     local name=$1 ref=$2 out=$ROOT/out/$1 dest=$ROOT/out/release/$1 rel
-    msg "$name: KernelSU-Next $ref"
     ksu_checkout "$ref"
+    msg "$name: KernelSU-Next $(git -C KernelSU-Next describe --tags --always)"
     [ $CLEAN = 0 ] || rm -rf "$out"
     mkdir -p "$out" "$dest"
 
     make -s O="$out" "${MAKE_ARGS[@]}" "$DEFCONFIG"
-    grep -q '^CONFIG_KSU=y' "$out/.config" || die "$name: CONFIG_KSU quedó desactivado"
-    grep -q '^CONFIG_KSU_MANUAL_HOOK=y' "$out/.config" || die "$name: CONFIG_KSU_MANUAL_HOOK quedó desactivado"
+    grep -q '^CONFIG_KSU=y' "$out/.config" || die "$name: CONFIG_KSU got disabled"
+    grep -q '^CONFIG_KSU_MANUAL_HOOK=y' "$out/.config" || die "$name: CONFIG_KSU_MANUAL_HOOK got disabled"
 
     if ! make O="$out" "${MAKE_ARGS[@]}" -j"$JOBS" LOCALVERSION="-$name" Image.gz dtbs > "$out/build.log" 2>&1; then
         grep -E "error|Error" "$out/build.log" | head -20 >&2
-        die "$name: falló la compilación (log: $out/build.log)"
+        die "$name: build failed (log: $out/build.log)"
     fi
+
     rel=$(cat "$out/include/config/kernel.release")
     cp "$out/arch/arm64/boot/Image.gz" "$dest/Image.gz"
     echo "    $rel"
@@ -131,4 +147,4 @@ for v in "${VARIANTS[@]}"; do
         stable) build_variant stable "$KSU_STABLE" ;;
     esac
 done
-msg "listo: out/release/"
+msg "done: out/release/"
